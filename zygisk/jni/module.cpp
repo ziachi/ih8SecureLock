@@ -22,6 +22,8 @@
 static int sdk = 0;
 static uint32_t relayout_code = 0;
 static uint32_t relayoutAsync_code = 0;
+static uint32_t addToDisplayAsUser_code = 0;
+static uint32_t addToDisplay_code = 0;
 static uint32_t registerScreenCaptureObserver_code = 0;
 
 static const char* PROC_NAME = "";
@@ -29,14 +31,66 @@ static const char* PROC_NAME = "";
 static bool getTransactionCodes(JNIEnv* env) {
     relayout_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayout"));
     relayoutAsync_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayoutAsync"));
+    addToDisplayAsUser_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("addToDisplayAsUser"));
+    addToDisplay_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("addToDisplay"));
     registerScreenCaptureObserver_code =
         getStaticIntFieldJni(env, STUB("android/app/IActivityTaskManager"), TRSCTN("registerScreenCaptureObserver"));
 
-    if (registerScreenCaptureObserver_code == 0 && relayoutAsync_code == 0 && relayout_code == 0) {
+    if (registerScreenCaptureObserver_code == 0 && relayoutAsync_code == 0 && relayout_code == 0 &&
+        addToDisplayAsUser_code == 0 && addToDisplay_code == 0) {
         LOGD("ERROR getTransactionCodes: Could not get any transaction codes");
         return false;
     }
+
+    // Log which hooks are active
+    if (relayout_code) LOGD("Hook relayout: code=%u", relayout_code);
+    if (relayoutAsync_code) LOGD("Hook relayoutAsync: code=%u", relayoutAsync_code);
+    if (addToDisplayAsUser_code) LOGD("Hook addToDisplayAsUser: code=%u", addToDisplayAsUser_code);
+    if (addToDisplay_code) LOGD("Hook addToDisplay: code=%u", addToDisplay_code);
+    if (registerScreenCaptureObserver_code) LOGD("Hook registerScreenCaptureObserver: code=%u", registerScreenCaptureObserver_code);
+
     return true;
+}
+
+// Strip FLAG_SECURE from LayoutParams.flags inside the binder parcel
+// LayoutParams parcel layout: [non-null marker][data_length][width][height][x][y][type][flags]...
+// After IWindow IBinder object, LayoutParams starts with non-null(4) + length(4) + width(4) + height(4) = skip 4*uint32
+// Then x(4) + y(4) + type(4) = skip 3*uint32, then flags is next
+static bool stripFlagSecureFromRelayout(FakeParcel& parcel) {
+    parcel.skipFlatObj();                              // IWindow flat binder obj
+    if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq (only on API <= 30)
+    parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams: non-null + length + width + height
+    parcel.skip(3 * sizeof(uint32_t));                 // x + y + type
+
+    auto* flags = parcel.peekInt32Ref();
+    if (*flags & FLAG_SECURE) {
+        *flags &= ~FLAG_SECURE;
+        return true;
+    }
+    return false;
+}
+
+// Strip FLAG_SECURE from LayoutParams in addToDisplayAsUser/addToDisplay
+// addToDisplayAsUser(IWindow window, in WindowManager.LayoutParams attrs, int viewVisibility,
+//                    int displayId, int userId, in InsetsVisibilities requestedVisibilities,
+//                    out InputChannel outInputChannel, out InsetsState insetsState,
+//                    out InsetsSourceControl[] activeControls, out Rect
+//                    
+// After binder headers + descriptor:
+//   IWindow (flat binder obj)
+//   LayoutParams attrs (Parcelable)
+// Same LayoutParams offset calculation as relayout
+static bool stripFlagSecureFromAddToDisplay(FakeParcel& parcel) {
+    parcel.skipFlatObj();                              // IWindow flat binder obj
+    parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams: non-null + length + width + height
+    parcel.skip(3 * sizeof(uint32_t));                 // x + y + type
+
+    auto* flags = parcel.peekInt32Ref();
+    if (*flags & FLAG_SECURE) {
+        *flags &= ~FLAG_SECURE;
+        return true;
+    }
+    return false;
 }
 
 int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
@@ -54,20 +108,19 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     auto descLen = parcel.readInt32();
     auto desc = parcel.readString16(descLen);
 
-    if ((code == relayout_code || code == relayoutAsync_code) &&
-        STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
+    if (STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
         memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
-        // remove FLAG_SECURE mask
 
-        parcel.skipFlatObj();                              // IWindow flat obj
-        if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
-        parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
-        parcel.skip(3 * sizeof(uint32_t));                 // requestedWidth, requestedHeight, viewVisibility
-
-        auto* flags = parcel.peekInt32Ref();
-        if (*flags & FLAG_SECURE) {
-            *flags &= ~FLAG_SECURE;
-            LOGD("Bypassed secure lock");
+        if (code == relayout_code || code == relayoutAsync_code) {
+            // Strip FLAG_SECURE from relayout LayoutParams
+            if (stripFlagSecureFromRelayout(parcel)) {
+                LOGD("Bypassed secure lock (relayout)");
+            }
+        } else if (code == addToDisplayAsUser_code || code == addToDisplay_code) {
+            // Strip FLAG_SECURE from addToDisplay LayoutParams (initial window creation)
+            if (stripFlagSecureFromAddToDisplay(parcel)) {
+                LOGD("Bypassed secure lock (addToDisplay)");
+            }
         }
     } else if (code == registerScreenCaptureObserver_code &&
                STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
@@ -102,6 +155,7 @@ static bool run(zygisk::Api* api, JNIEnv* env) {
         LOGD("ERROR android_get_device_api_level: %d", sdk);
         return false;
     }
+    LOGD("SDK: %d", sdk);
     if (!getTransactionCodes(env)) return false;
     if (!hookBinder(api)) return false;
     return true;

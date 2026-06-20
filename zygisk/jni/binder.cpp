@@ -92,3 +92,17 @@ bool readFullFromFd(int fd, void* buf, off_t size) {
     }
     return true;
 }
+
+// Minimal cxa_guard stubs for APP_STL=none (single-threaded init is fine here)
+extern "C" {
+    int __cxa_guard_acquire(int* guard) {
+        if (*guard) return 0;
+        return 1;
+    }
+    void __cxa_guard_release(int* guard) {
+        *guard = 1;
+    }
+    void __cxa_guard_abort(int* guard) {
+        (void)guard;
+    }
+}
