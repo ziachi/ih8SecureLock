@@ -42,7 +42,6 @@ static bool getTransactionCodes(JNIEnv* env) {
         return false;
     }
 
-    // Log which hooks are active
     if (relayout_code) LOGD("Hook relayout: code=%u", relayout_code);
     if (relayoutAsync_code) LOGD("Hook relayoutAsync: code=%u", relayoutAsync_code);
     if (addToDisplayAsUser_code) LOGD("Hook addToDisplayAsUser: code=%u", addToDisplayAsUser_code);
@@ -52,36 +51,14 @@ static bool getTransactionCodes(JNIEnv* env) {
     return true;
 }
 
-// Strip FLAG_SECURE from LayoutParams.flags inside the binder parcel
-// LayoutParams parcel layout: [non-null marker][data_length][width][height][x][y][type][flags]...
-// After IWindow IBinder object, LayoutParams starts with non-null(4) + length(4) + width(4) + height(4) = skip 4*uint32
-// Then x(4) + y(4) + type(4) = skip 3*uint32, then flags is next
-static bool stripFlagSecureFromRelayout(FakeParcel& parcel) {
+// Strip FLAG_SECURE from LayoutParams.flags inside binder parcel.
+// LayoutParams layout in parcel: [non-null(4)][length(4)][width(4)][height(4)][x(4)][y(4)][type(4)][flags(4)]...
+// relayout params: IWindow, [seq on SDK<=30], LayoutParams attrs, ...
+// addToDisplay params: IWindow, seq, LayoutParams attrs, ...   (SDK <= 30, has seq)
+// addToDisplayAsUser params: IWindow, LayoutParams attrs, ...  (SDK >= 31, no seq)
+static bool stripFlagSecureFromLayoutParams(FakeParcel& parcel, bool has_seq) {
     parcel.skipFlatObj();                              // IWindow flat binder obj
-    if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq (only on API <= 30)
-    parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams: non-null + length + width + height
-    parcel.skip(3 * sizeof(uint32_t));                 // x + y + type
-
-    auto* flags = parcel.peekInt32Ref();
-    if (*flags & FLAG_SECURE) {
-        *flags &= ~FLAG_SECURE;
-        return true;
-    }
-    return false;
-}
-
-// Strip FLAG_SECURE from LayoutParams in addToDisplayAsUser/addToDisplay
-// addToDisplayAsUser(IWindow window, in WindowManager.LayoutParams attrs, int viewVisibility,
-//                    int displayId, int userId, in InsetsVisibilities requestedVisibilities,
-//                    out InputChannel outInputChannel, out InsetsState insetsState,
-//                    out InsetsSourceControl[] activeControls, out Rect
-//                    
-// After binder headers + descriptor:
-//   IWindow (flat binder obj)
-//   LayoutParams attrs (Parcelable)
-// Same LayoutParams offset calculation as relayout
-static bool stripFlagSecureFromAddToDisplay(FakeParcel& parcel) {
-    parcel.skipFlatObj();                              // IWindow flat binder obj
+    if (has_seq) parcel.skip(1 * sizeof(uint32_t));    // seq param (present in relayout/addToDisplay on SDK<=30)
     parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams: non-null + length + width + height
     parcel.skip(3 * sizeof(uint32_t));                 // x + y + type
 
@@ -103,7 +80,7 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     if (pparcel->data_size < binder_headers_len + 4) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
-    parcel.skip(binder_headers_len);  // header
+    parcel.skip(binder_headers_len);
 
     auto descLen = parcel.readInt32();
     auto desc = parcel.readString16(descLen);
@@ -112,20 +89,25 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
         memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
 
         if (code == relayout_code || code == relayoutAsync_code) {
-            // Strip FLAG_SECURE from relayout LayoutParams
-            if (stripFlagSecureFromRelayout(parcel)) {
+            // relayout has seq on SDK <= 30
+            bool has_seq = (sdk <= 30);
+            if (stripFlagSecureFromLayoutParams(parcel, has_seq)) {
                 LOGD("Bypassed secure lock (relayout)");
             }
-        } else if (code == addToDisplayAsUser_code || code == addToDisplay_code) {
-            // Strip FLAG_SECURE from addToDisplay LayoutParams (initial window creation)
-            if (stripFlagSecureFromAddToDisplay(parcel)) {
+        } else if (code == addToDisplay_code) {
+            // addToDisplay (SDK <= 30) always has seq parameter
+            if (stripFlagSecureFromLayoutParams(parcel, true)) {
                 LOGD("Bypassed secure lock (addToDisplay)");
+            }
+        } else if (code == addToDisplayAsUser_code) {
+            // addToDisplayAsUser (SDK >= 31) has NO seq parameter
+            if (stripFlagSecureFromLayoutParams(parcel, false)) {
+                LOGD("Bypassed secure lock (addToDisplayAsUser)");
             }
         }
     } else if (code == registerScreenCaptureObserver_code &&
                STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
                memcmp(desc, I_ACTIVITY_TASKMANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
-        // early-return from capture listener
         LOGD("Bypassed screenshot listener");
         return 0;
     }
