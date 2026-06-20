@@ -56,13 +56,14 @@ static bool getTransactionCodes(JNIEnv* env) {
 // relayout params: IWindow, [seq on SDK<=30], LayoutParams attrs, ...
 // addToDisplay params: IWindow, seq, LayoutParams attrs, ...   (SDK <= 30, has seq)
 // addToDisplayAsUser params: IWindow, LayoutParams attrs, ...  (SDK >= 31, no seq)
-static bool stripFlagSecureFromLayoutParams(FakeParcel& parcel, bool has_seq) {
+static bool stripFlagSecureFromLayoutParams(FakeParcel& parcel, bool has_seq, const char* hook_name) {
     parcel.skipFlatObj();                              // IWindow flat binder obj
-    if (has_seq) parcel.skip(1 * sizeof(uint32_t));    // seq param (present in relayout/addToDisplay on SDK<=30)
+    if (has_seq) parcel.skip(1 * sizeof(uint32_t));    // seq param
     parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams: non-null + length + width + height
     parcel.skip(3 * sizeof(uint32_t));                 // x + y + type
 
     auto* flags = parcel.peekInt32Ref();
+    LOGD("DEBUG %s: flags=0x%08x at offset=%u has_seq=%d", hook_name, *flags, parcel.getCursor(), has_seq);
     if (*flags & FLAG_SECURE) {
         *flags &= ~FLAG_SECURE;
         return true;
@@ -89,19 +90,16 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
         memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
 
         if (code == relayout_code || code == relayoutAsync_code) {
-            // relayout has seq on SDK <= 30
             bool has_seq = (sdk <= 30);
-            if (stripFlagSecureFromLayoutParams(parcel, has_seq)) {
+            if (stripFlagSecureFromLayoutParams(parcel, has_seq, "relayout")) {
                 LOGD("Bypassed secure lock (relayout)");
             }
         } else if (code == addToDisplay_code) {
-            // addToDisplay (SDK <= 30) always has seq parameter
-            if (stripFlagSecureFromLayoutParams(parcel, true)) {
+            if (stripFlagSecureFromLayoutParams(parcel, true, "addToDisplay")) {
                 LOGD("Bypassed secure lock (addToDisplay)");
             }
         } else if (code == addToDisplayAsUser_code) {
-            // addToDisplayAsUser (SDK >= 31) has NO seq parameter
-            if (stripFlagSecureFromLayoutParams(parcel, false)) {
+            if (stripFlagSecureFromLayoutParams(parcel, false, "addToDisplayAsUser")) {
                 LOGD("Bypassed secure lock (addToDisplayAsUser)");
             }
         }
